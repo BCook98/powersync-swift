@@ -27,6 +27,12 @@ public protocol SyncStatusData: Sendable {
     /// - Note: This value is `nil` when the state is unknown, for example, when the state is still being loaded.
     var hasSynced: Bool? { get }
 
+    /// The most recent public sync checkpoint successfully applied during this process.
+    ///
+    /// This is `nil` until a full checkpoint has been received and applied. The value is
+    /// derived from public sync-protocol messages and does not read PowerSync's private tables.
+    var completedCheckpoint: CompletedSyncCheckpoint? { get }
+
     /// Represents any error that occurred during uploading.
     /// - Note: This value is cleared on the next successful upload.
     var uploadError: Any? { get }
@@ -67,6 +73,11 @@ public protocol SyncStatus: SyncStatusData, Sendable {
     /// An observable alternative to `asFlow()` that updates when the sync status changes.
     @available(macOS 14.0, iOS 17.0, watchOS 10.0, tvOS 17.0, *)
     @MainActor var observable: ObservableSyncStatus {get}
+}
+
+public extension SyncStatusData {
+    /// Custom status implementations that do not track protocol checkpoints remain source compatible.
+    var completedCheckpoint: CompletedSyncCheckpoint? { nil }
 }
 
 /// Current information about a ``SyncStreamSubscription``.
@@ -137,6 +148,7 @@ public final class ObservableSyncStatus {
     public var uploading: Bool { status.uploading }
     public var lastSyncedAt: Date? { status.lastSyncedAt }
     public var hasSynced: Bool? { status.hasSynced }
+    public var completedCheckpoint: CompletedSyncCheckpoint? { status.completedCheckpoint }
     public var uploadError: Any? { status.uploadError }
     public var downloadError: Any? { status.downloadError }
     public var anyError: Any? { status.anyError }

@@ -5,6 +5,7 @@ import AsyncAlgorithms
 
 enum SyncLine: Encodable {
     case fullCheckpoint(Checkpoint)
+    case checkpointDiff(CheckpointDiff)
     case checkpointComplete(lastOpId: String)
     case checkpointPartiallyComplete(lastOpId: String, priority: BucketPriority)
     case syncDataBucket(SyncDataBucket)
@@ -12,6 +13,7 @@ enum SyncLine: Encodable {
     
     enum CodingKeys: String, CodingKey {
         case fullCheckpoint = "checkpoint"
+        case checkpointDiff = "checkpoint_diff"
         case checkpointComplete = "checkpoint_complete"
         case checkpointPartiallyComplete = "partial_checkpoint_complete"
         case syncDataBucket = "data"
@@ -32,6 +34,9 @@ enum SyncLine: Encodable {
         switch self {
         case .fullCheckpoint(let checkpoint):
             var nestedContainer = container.nestedContainer(keyedBy: Checkpoint.CodingKeys.self, forKey: .fullCheckpoint)
+            try checkpoint.encodeToContainer(&nestedContainer)
+        case .checkpointDiff(let checkpoint):
+            var nestedContainer = container.nestedContainer(keyedBy: CheckpointDiff.CodingKeys.self, forKey: .checkpointDiff)
             try checkpoint.encodeToContainer(&nestedContainer)
         case .checkpointComplete(let lastOpId):
             var nestedContainer = container.nestedContainer(keyedBy: SyncLine.CheckpointCompleteCodingKeys.self, forKey: .checkpointComplete)
@@ -91,6 +96,27 @@ struct Checkpoint {
         try container.encode(self.buckets, forKey: .buckets)
         try container.encode(self.writeCheckpoint, forKey: .writeCheckpoint)
         try container.encode(self.streams, forKey: .streams)
+    }
+}
+
+struct CheckpointDiff {
+    var lastOpID: String
+    var updatedBuckets: [BucketChecksum]
+    var removedBuckets: [String]
+    var writeCheckpoint: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case lastOpID = "last_op_id"
+        case updatedBuckets = "updated_buckets"
+        case removedBuckets = "removed_buckets"
+        case writeCheckpoint = "write_checkpoint"
+    }
+
+    func encodeToContainer(_ container: inout KeyedEncodingContainer<CodingKeys>) throws {
+        try container.encode(lastOpID, forKey: .lastOpID)
+        try container.encode(updatedBuckets, forKey: .updatedBuckets)
+        try container.encode(removedBuckets, forKey: .removedBuckets)
+        try container.encodeIfPresent(writeCheckpoint, forKey: .writeCheckpoint)
     }
 }
 
