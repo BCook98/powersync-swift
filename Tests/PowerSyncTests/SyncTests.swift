@@ -85,15 +85,79 @@ class InMemorySyncIntegrationTests {
         try await db.close()
     }
 
+    @Test func completedCheckpointRejectsMalformedDiffBeforeCoreMutation() async throws {
+        let channel = AsyncThrowingChannel<Data, any Error>()
+        let db = openDatabase(MockHttpSession { _ in channel })
+        try await db.connect(
+            connector: TestConnector(),
+            options: ConnectOptions(retryDelay: 60)
+        )
+        await waitForStatus(db.currentStatus) { $0.connected }
+
+        try await channel.pushLine(.fullCheckpoint(Checkpoint(
+            last_op_id: "1",
+            buckets: [BucketChecksum(bucket: "a", checksum: 0)]
+        )))
+        try await channel.pushLine(.checkpointComplete(lastOpId: "1"))
+        await waitForStatus(db.currentStatus) { $0.completedCheckpoint?.lastOpID == 1 }
+
+        func bucketState() async throws -> [String] {
+            try await db.getAll(
+                "SELECT name, last_applied_op FROM ps_buckets ORDER BY name"
+            ) { cursor in
+                "\(try cursor.getString(index: 0)):\(try cursor.getInt64(index: 1))"
+            }
+        }
+        let acceptedBucketState = try await bucketState()
+
+        let contradictoryDiff = #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"a","checksum":0}],"removed_buckets":["a"]}}"#
+        await channel.send(Data("\(contradictoryDiff)\n".utf8))
+
+        await waitForStatus(db.currentStatus) { $0.downloadError != nil }
+        #expect(
+            db.currentStatus.downloadError as? CompletedSyncCheckpointTrackerError
+                == .contradictoryBucketChange
+        )
+        #expect(db.currentStatus.completedCheckpoint?.lastOpID == 1)
+        #expect(try await bucketState() == acceptedBucketState)
+
+        try await db.close()
+    }
+
+    @Test func completedCheckpointRejectsMismatchedCompletionBeforeCoreAcceptance() async throws {
+        let channel = AsyncThrowingChannel<Data, any Error>()
+        let db = openDatabase(MockHttpSession { _ in channel })
+        try await db.connect(
+            connector: TestConnector(),
+            options: ConnectOptions(retryDelay: 60)
+        )
+        await waitForStatus(db.currentStatus) { $0.connected }
+
+        try await channel.pushLine(.fullCheckpoint(Checkpoint(
+            last_op_id: "1",
+            buckets: [BucketChecksum(bucket: "a", checksum: 0)]
+        )))
+        try await channel.pushLine(.checkpointComplete(lastOpId: "2"))
+
+        await waitForStatus(db.currentStatus) { $0.downloadError != nil }
+        #expect(
+            db.currentStatus.downloadError as? CompletedSyncCheckpointTrackerError
+                == .mismatchedCheckpointCompletion
+        )
+        #expect(db.currentStatus.completedCheckpoint == nil)
+
+        try await db.close()
+    }
+
     @Test func completedCheckpointNormalizesSignedAndUnsignedChecksumBits() throws {
         var tracker = CompletedSyncCheckpointTracker()
 
-        try tracker.receiveAcceptedProtocolLine(
+        try tracker.receiveProtocolLine(
             #"{"checkpoint":{"last_op_id":"1","buckets":[{"bucket":"a","checksum":-1}]}}"#
         )
         #expect(tracker.current?.buckets == [.init(name: "a", checksum: UInt32.max)])
 
-        try tracker.receiveAcceptedProtocolLine(
+        try tracker.receiveProtocolLine(
             #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"a","checksum":4294967295}],"removed_buckets":[]}}"#
         )
         #expect(tracker.current?.lastOpID == 2)
@@ -104,85 +168,104 @@ class InMemorySyncIntegrationTests {
         var tracker = CompletedSyncCheckpointTracker()
 
         #expect(throws: CompletedSyncCheckpointTrackerError.negativeLastOperationID) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"-1","updated_buckets":[],"removed_buckets":[]}}"#
             )
         }
         #expect(tracker.current == nil)
 
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"1","updated_buckets":[{"bucket":"a","checksum":1},{"bucket":"a","checksum":2}],"removed_buckets":[]}}"#
             )
         }
         #expect(tracker.current == nil)
 
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"1","updated_buckets":[],"removed_buckets":["a","a"]}}"#
             )
         }
         #expect(tracker.current == nil)
 
         #expect(throws: CompletedSyncCheckpointTrackerError.contradictoryBucketChange) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"1","updated_buckets":[{"bucket":"a","checksum":1}],"removed_buckets":["a"]}}"#
             )
         }
         #expect(tracker.current == nil)
 
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint":{"last_op_id":"1","buckets":[{"bucket":"a","checksum":1},{"bucket":"a","checksum":2}]}}"#
             )
         }
         #expect(tracker.current == nil)
 
-        try tracker.receiveAcceptedProtocolLine(
+        try tracker.receiveProtocolLine(
             #"{"checkpoint":{"last_op_id":"1","buckets":[{"bucket":"a","checksum":1}]}}"#
         )
         let accepted = tracker.current
 
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"b","checksum":1},{"bucket":"b","checksum":2}],"removed_buckets":[]}}"#
             )
         }
         #expect(tracker.current == accepted)
 
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateCheckpointEnvelopeKey) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint":{"last_op_id":"2","buckets":[{"bucket":"b","checksum":2}]},"checkpoint":{"last_op_id":"3","buckets":[{"bucket":"c","checksum":3}]}}"#
             )
         }
         #expect(tracker.current == accepted)
 
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateCheckpointEnvelopeKey) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"b","checksum":2}],"removed_buckets":[]},"checkpoint_diff":{"last_op_id":"3","updated_buckets":[],"removed_buckets":["a"]}}"#
             )
         }
         #expect(tracker.current == accepted)
 
         #expect(throws: CompletedSyncCheckpointTrackerError.ambiguousCheckpointEnvelope) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint":{"last_op_id":"2","buckets":[{"bucket":"b","checksum":2}]},"checkpoint_diff":{"last_op_id":"3","updated_buckets":[{"bucket":"c","checksum":3}],"removed_buckets":["a"]}}"#
             )
         }
         #expect(tracker.current == accepted)
 
         #expect(throws: CompletedSyncCheckpointTrackerError.contradictoryBucketChange) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"a","checksum":2}],"removed_buckets":["a"]}}"#
             )
         }
         #expect(tracker.current == accepted)
 
         #expect(throws: CompletedSyncCheckpointTrackerError.negativeLastOperationID) {
-            try tracker.receiveAcceptedProtocolLine(
+            try tracker.receiveProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"-1","updated_buckets":[],"removed_buckets":[]}}"#
             )
         }
+        #expect(tracker.current == accepted)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.mismatchedCheckpointCompletion) {
+            try tracker.receiveProtocolLine(
+                #"{"checkpoint_complete":{"last_op_id":"2"}}"#
+            )
+        }
+        #expect(tracker.current == accepted)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.duplicateCheckpointEnvelopeKey) {
+            try tracker.receiveProtocolLine(
+                #"{"checkpoint_complete":{"last_op_id":"1"},"checkpoint_complete":{"last_op_id":"1"}}"#
+            )
+        }
+        #expect(tracker.current == accepted)
+
+        try tracker.receiveProtocolLine(
+            #"{"checkpoint_complete":{"last_op_id":"1"}}"#
+        )
         #expect(tracker.current == accepted)
     }
 
@@ -248,13 +331,15 @@ class InMemorySyncIntegrationTests {
         )
         let expectedPublicationPipeline = """
         for try await arg in controlArgs {
-                    let control = try await powersyncControl(arg)
-
-                    // Parse only after the core has accepted and durably processed this protocol line.
-                    // The tracked value remains unpublished until DidCompleteSync confirms application.
+                    // Validate into a value-semantic candidate before the core can mutate its
+                    // transaction. Commit the candidate only after the core accepts the line.
+                    var nextCompletedCheckpointTracker = completedCheckpointTracker
                     if case .textLine(line: let line) = arg {
-                        try completedCheckpointTracker.receiveAcceptedProtocolLine(line)
+                        try nextCompletedCheckpointTracker.receiveProtocolLine(line)
                     }
+
+                    let control = try await powersyncControl(arg)
+                    completedCheckpointTracker = nextCompletedCheckpointTracker
 
                     for instr in control {
                         if case let .closeSyncStream(hideDisconnect) = instr {
@@ -517,7 +602,7 @@ class InMemorySyncIntegrationTests {
 
         // Then complete the sync
         try await pushData(priority: 3)
-        try await channel.pushLine(.checkpointComplete(lastOpId: String(operationId)))
+        try await channel.pushLine(.checkpointComplete(lastOpId: "4"))
         try await db.waitForFirstSync()
         try await expectUserCount(db, 4)
 
@@ -2403,7 +2488,7 @@ class InMemorySyncIntegrationTests {
             try await b.waitForFirstSync()
         }
 
-        try await channel.pushLine(.checkpointComplete(lastOpId: "0"))
+        try await channel.pushLine(.checkpointComplete(lastOpId: "1"))
         try await a.waitForFirstSync()
         try await db.close()
     }

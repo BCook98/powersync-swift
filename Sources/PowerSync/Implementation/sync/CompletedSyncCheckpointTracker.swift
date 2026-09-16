@@ -6,12 +6,14 @@ enum CompletedSyncCheckpointTrackerError: Error, Equatable {
     case contradictoryBucketChange
     case ambiguousCheckpointEnvelope
     case duplicateCheckpointEnvelopeKey
+    case mismatchedCheckpointCompletion
 }
 
-/// Tracks checkpoint state from accepted public sync-protocol lines.
+/// Validates and tracks candidate checkpoint state from public sync-protocol lines.
 ///
-/// The tracker deliberately has no database or logging dependency. Its current value is
-/// only a candidate until the core reports that the checkpoint was successfully applied.
+/// The tracker deliberately has no database or logging dependency. Callers copy it before
+/// validation and commit that copy only after the core accepts the same line. Its current
+/// value remains unpublished until the core reports that the checkpoint was applied.
 struct CompletedSyncCheckpointTracker {
     private var lastOpID: Int64?
     private var buckets: [[UInt8]: CompletedSyncCheckpoint.Bucket] = [:]
@@ -27,7 +29,7 @@ struct CompletedSyncCheckpointTracker {
         )
     }
 
-    mutating func receiveAcceptedProtocolLine(_ line: String) throws {
+    mutating func receiveProtocolLine(_ line: String) throws {
         try rejectRepeatedCheckpointEnvelopeKeys(in: line)
 
         let envelope = try StreamingSyncClient.jsonDecoder.decode(
@@ -35,7 +37,12 @@ struct CompletedSyncCheckpointTracker {
             from: Data(line.utf8)
         )
 
-        guard envelope.checkpoint == nil || envelope.checkpointDiff == nil else {
+        let checkpointEnvelopeCount = [
+            envelope.checkpoint != nil,
+            envelope.checkpointDiff != nil,
+            envelope.checkpointComplete != nil,
+        ].filter { $0 }.count
+        guard checkpointEnvelopeCount <= 1 else {
             throw CompletedSyncCheckpointTrackerError.ambiguousCheckpointEnvelope
         }
 
@@ -95,6 +102,13 @@ struct CompletedSyncCheckpointTracker {
             }
             buckets = nextBuckets
             lastOpID = diff.lastOpID
+        } else if let completion = envelope.checkpointComplete {
+            guard completion.lastOpID >= 0 else {
+                throw CompletedSyncCheckpointTrackerError.negativeLastOperationID
+            }
+            guard completion.lastOpID == lastOpID else {
+                throw CompletedSyncCheckpointTrackerError.mismatchedCheckpointCompletion
+            }
         }
     }
 }
@@ -103,7 +117,8 @@ private func rejectRepeatedCheckpointEnvelopeKeys(in line: String) throws {
     let scanner = TopLevelJSONObjectKeyScanner(bytes: Array(line.utf8))
     var seenCheckpointKeys = Set<String>()
 
-    for key in try scanner.keys() where key == "checkpoint" || key == "checkpoint_diff" {
+    for key in try scanner.keys()
+    where key == "checkpoint" || key == "checkpoint_diff" || key == "checkpoint_complete" {
         guard seenCheckpointKeys.insert(key).inserted else {
             throw CompletedSyncCheckpointTrackerError.duplicateCheckpointEnvelopeKey
         }
@@ -183,10 +198,20 @@ private struct TopLevelJSONObjectKeyScanner {
 private struct CheckpointProtocolEnvelope: Decodable {
     let checkpoint: ProtocolCheckpoint?
     let checkpointDiff: ProtocolCheckpointDiff?
+    let checkpointComplete: ProtocolCheckpointCompletion?
 
     enum CodingKeys: String, CodingKey {
         case checkpoint
         case checkpointDiff = "checkpoint_diff"
+        case checkpointComplete = "checkpoint_complete"
+    }
+}
+
+private struct ProtocolCheckpointCompletion: Decodable {
+    @StringEncodedInt64 var lastOpID: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case lastOpID = "last_op_id"
     }
 }
 
