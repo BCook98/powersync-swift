@@ -100,30 +100,92 @@ class InMemorySyncIntegrationTests {
         #expect(tracker.current?.buckets == [.init(name: "a", checksum: UInt32.max)])
     }
 
-    @Test func completedCheckpointTrackerDoesNotQueryPrivateState() throws {
+    @Test func completedCheckpointRejectsAmbiguousProtocolStateAtomically() throws {
+        var tracker = CompletedSyncCheckpointTracker()
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint":{"last_op_id":"1","buckets":[{"bucket":"a","checksum":1},{"bucket":"a","checksum":2}]}}"#
+            )
+        }
+        #expect(tracker.current == nil)
+
+        try tracker.receiveAcceptedProtocolLine(
+            #"{"checkpoint":{"last_op_id":"1","buckets":[{"bucket":"a","checksum":1}]}}"#
+        )
+        let accepted = tracker.current
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"b","checksum":1},{"bucket":"b","checksum":2}],"removed_buckets":[]}}"#
+            )
+        }
+        #expect(tracker.current == accepted)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.contradictoryBucketChange) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"a","checksum":2}],"removed_buckets":["a"]}}"#
+            )
+        }
+        #expect(tracker.current == accepted)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.negativeLastOperationID) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint_diff":{"last_op_id":"-1","updated_buckets":[],"removed_buckets":[]}}"#
+            )
+        }
+        #expect(tracker.current == accepted)
+    }
+
+    @Test func completedCheckpointPipelineDoesNotQueryPrivateState() throws {
         let testFile = URL(fileURLWithPath: #filePath)
         let repositoryRoot = testFile
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let trackerSource = try String(
-            contentsOf: repositoryRoot.appendingPathComponent(
-                "Sources/PowerSync/Implementation/sync/CompletedSyncCheckpointTracker.swift"
-            ),
-            encoding: .utf8
-        )
-
-        let forbiddenFragments = [
+        let checkpointSourcePaths = [
+            "Sources/PowerSync/Protocol/sync/CompletedSyncCheckpoint.swift",
+            "Sources/PowerSync/Implementation/sync/CompletedSyncCheckpointTracker.swift",
+            "Sources/PowerSync/Implementation/sync/Status.swift",
+            "Sources/PowerSync/Implementation/sync/StreamingSyncClient.swift",
+        ]
+        let checkpointSources = try checkpointSourcePaths.map { relativePath in
+            try String(
+                contentsOf: repositoryRoot.appendingPathComponent(relativePath),
+                encoding: .utf8
+            )
+        }
+        let universalForbiddenFragments = [
             "ps_" + "buckets",
             "ps_" + "oplog",
+        ]
+        for source in checkpointSources {
+            for fragment in universalForbiddenFragments {
+                #expect(!source.contains(fragment))
+            }
+        }
+
+        let pureSourceForbiddenFragments = [
             "SELECT ",
             "writeTransaction",
             "readTransaction",
             "requestLogger",
             ".logger",
         ]
-        for fragment in forbiddenFragments {
-            #expect(!trackerSource.contains(fragment))
+        for source in checkpointSources.prefix(3) {
+            for fragment in pureSourceForbiddenFragments {
+                #expect(!source.contains(fragment))
+            }
+        }
+
+        let streamingSource = checkpointSources[3]
+        let requiredPublicPipelineFragments = [
+            "try completedCheckpointTracker.receiveAcceptedProtocolLine(line)",
+            "completedCheckpoint: completedCheckpointTracker.current",
+            "if let completedCheckpoint {\n                    $0.completedCheckpoint = completedCheckpoint",
+        ]
+        for fragment in requiredPublicPipelineFragments {
+            #expect(streamingSource.contains(fragment))
         }
     }
 

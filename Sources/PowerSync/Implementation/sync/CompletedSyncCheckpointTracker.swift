@@ -1,5 +1,11 @@
 import Foundation
 
+enum CompletedSyncCheckpointTrackerError: Error, Equatable {
+    case negativeLastOperationID
+    case duplicateBucketName
+    case contradictoryBucketChange
+}
+
 /// Tracks checkpoint state from accepted public sync-protocol lines.
 ///
 /// The tracker deliberately has no database or logging dependency. Its current value is
@@ -26,30 +32,60 @@ struct CompletedSyncCheckpointTracker {
         )
 
         if let checkpoint = envelope.checkpoint {
-            lastOpID = checkpoint.lastOpID
-            buckets = Dictionary(
-                checkpoint.buckets.map {
-                    (
-                        Array($0.name.utf8),
-                        CompletedSyncCheckpoint.Bucket(name: $0.name, checksum: $0.checksum.value)
-                    )
-                },
-                uniquingKeysWith: { _, replacement in replacement }
-            )
-        } else if let diff = envelope.checkpointDiff {
-            guard lastOpID != nil else {
-                return
+            guard checkpoint.lastOpID >= 0 else {
+                throw CompletedSyncCheckpointTrackerError.negativeLastOperationID
             }
-
-            for name in diff.removedBuckets {
-                buckets.removeValue(forKey: Array(name.utf8))
-            }
-            for bucket in diff.updatedBuckets {
-                buckets[Array(bucket.name.utf8)] = CompletedSyncCheckpoint.Bucket(
+            var nextBuckets: [[UInt8]: CompletedSyncCheckpoint.Bucket] = [:]
+            for bucket in checkpoint.buckets {
+                let key = Array(bucket.name.utf8)
+                guard nextBuckets[key] == nil else {
+                    throw CompletedSyncCheckpointTrackerError.duplicateBucketName
+                }
+                nextBuckets[key] = CompletedSyncCheckpoint.Bucket(
                     name: bucket.name,
                     checksum: bucket.checksum.value
                 )
             }
+            lastOpID = checkpoint.lastOpID
+            buckets = nextBuckets
+        } else if let diff = envelope.checkpointDiff {
+            guard lastOpID != nil else {
+                return
+            }
+            guard diff.lastOpID >= 0 else {
+                throw CompletedSyncCheckpointTrackerError.negativeLastOperationID
+            }
+
+            var removedBucketKeys = Set<[UInt8]>()
+            for name in diff.removedBuckets {
+                guard removedBucketKeys.insert(Array(name.utf8)).inserted else {
+                    throw CompletedSyncCheckpointTrackerError.duplicateBucketName
+                }
+            }
+
+            var updatedBuckets: [[UInt8]: CompletedSyncCheckpoint.Bucket] = [:]
+            for bucket in diff.updatedBuckets {
+                let key = Array(bucket.name.utf8)
+                guard updatedBuckets[key] == nil else {
+                    throw CompletedSyncCheckpointTrackerError.duplicateBucketName
+                }
+                updatedBuckets[key] = CompletedSyncCheckpoint.Bucket(
+                    name: bucket.name,
+                    checksum: bucket.checksum.value
+                )
+            }
+            guard removedBucketKeys.isDisjoint(with: updatedBuckets.keys) else {
+                throw CompletedSyncCheckpointTrackerError.contradictoryBucketChange
+            }
+
+            var nextBuckets = buckets
+            for key in removedBucketKeys {
+                nextBuckets.removeValue(forKey: key)
+            }
+            for (key, bucket) in updatedBuckets {
+                nextBuckets[key] = bucket
+            }
+            buckets = nextBuckets
             lastOpID = diff.lastOpID
         }
     }
