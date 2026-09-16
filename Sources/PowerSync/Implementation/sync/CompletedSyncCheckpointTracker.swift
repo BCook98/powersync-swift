@@ -4,6 +4,7 @@ enum CompletedSyncCheckpointTrackerError: Error, Equatable {
     case negativeLastOperationID
     case duplicateBucketName
     case contradictoryBucketChange
+    case ambiguousCheckpointEnvelope
 }
 
 /// Tracks checkpoint state from accepted public sync-protocol lines.
@@ -31,6 +32,10 @@ struct CompletedSyncCheckpointTracker {
             from: Data(line.utf8)
         )
 
+        guard envelope.checkpoint == nil || envelope.checkpointDiff == nil else {
+            throw CompletedSyncCheckpointTrackerError.ambiguousCheckpointEnvelope
+        }
+
         if let checkpoint = envelope.checkpoint {
             guard checkpoint.lastOpID >= 0 else {
                 throw CompletedSyncCheckpointTrackerError.negativeLastOperationID
@@ -49,11 +54,11 @@ struct CompletedSyncCheckpointTracker {
             lastOpID = checkpoint.lastOpID
             buckets = nextBuckets
         } else if let diff = envelope.checkpointDiff {
-            guard lastOpID != nil else {
-                return
-            }
             guard diff.lastOpID >= 0 else {
                 throw CompletedSyncCheckpointTrackerError.negativeLastOperationID
+            }
+            guard lastOpID != nil else {
+                return
             }
 
             var removedBucketKeys = Set<[UInt8]>()

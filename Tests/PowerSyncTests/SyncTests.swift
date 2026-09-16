@@ -103,6 +103,13 @@ class InMemorySyncIntegrationTests {
     @Test func completedCheckpointRejectsAmbiguousProtocolStateAtomically() throws {
         var tracker = CompletedSyncCheckpointTracker()
 
+        #expect(throws: CompletedSyncCheckpointTrackerError.negativeLastOperationID) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint_diff":{"last_op_id":"-1","updated_buckets":[],"removed_buckets":[]}}"#
+            )
+        }
+        #expect(tracker.current == nil)
+
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
             try tracker.receiveAcceptedProtocolLine(
                 #"{"checkpoint":{"last_op_id":"1","buckets":[{"bucket":"a","checksum":1},{"bucket":"a","checksum":2}]}}"#
@@ -118,6 +125,13 @@ class InMemorySyncIntegrationTests {
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
             try tracker.receiveAcceptedProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"b","checksum":1},{"bucket":"b","checksum":2}],"removed_buckets":[]}}"#
+            )
+        }
+        #expect(tracker.current == accepted)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.ambiguousCheckpointEnvelope) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint":{"last_op_id":"2","buckets":[{"bucket":"b","checksum":2}]},"checkpoint_diff":{"last_op_id":"3","updated_buckets":[{"bucket":"c","checksum":3}],"removed_buckets":["a"]}}"#
             )
         }
         #expect(tracker.current == accepted)
@@ -179,13 +193,93 @@ class InMemorySyncIntegrationTests {
         }
 
         let streamingSource = checkpointSources[3]
-        let requiredPublicPipelineFragments = [
-            "try completedCheckpointTracker.receiveAcceptedProtocolLine(line)",
-            "completedCheckpoint: completedCheckpointTracker.current",
-            "if let completedCheckpoint {\n                    $0.completedCheckpoint = completedCheckpoint",
+        func boundedSource(
+            from start: String,
+            until end: String,
+            in source: String
+        ) throws -> String {
+            let startRange = try #require(source.range(of: start))
+            let endRange = try #require(
+                source.range(of: end, range: startRange.upperBound..<source.endIndex)
+            )
+            return String(source[startRange.lowerBound..<endRange.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let publicationPipeline = try boundedSource(
+            from: "for try await arg in controlArgs {",
+            until: "if !hadSyncLine && arg.isSyncLine()",
+            in: streamingSource
+        )
+        let expectedPublicationPipeline = """
+        for try await arg in controlArgs {
+                    let control = try await powersyncControl(arg)
+
+                    // Parse only after the core has accepted and durably processed this protocol line.
+                    // The tracked value remains unpublished until DidCompleteSync confirms application.
+                    if case .textLine(line: let line) = arg {
+                        try completedCheckpointTracker.receiveAcceptedProtocolLine(line)
+                    }
+
+                    for instr in control {
+                        if case let .closeSyncStream(hideDisconnect) = instr {
+                            return SyncIterationResult(hideDisconnect: hideDisconnect)
+                        }
+
+                        try await execute(
+                            instr: instr,
+                            completedCheckpoint: completedCheckpointTracker.current,
+                            group: &group
+                        )
+                    }
+        """
+        #expect(publicationPipeline == expectedPublicationPipeline)
+
+        let coreAcceptance = try boundedSource(
+            from: "private func powersyncControl(_ args: PowerSyncControlArguments)",
+            until: "private func execute(",
+            in: streamingSource
+        )
+        let expectedCoreAcceptance = """
+        private func powersyncControl(_ args: PowerSyncControlArguments) async throws -> [Instruction] {
+                try await syncClient.db.writeTransaction { tx in
+                    try tx.powersyncControl(args)
+                }
+            }
+        """
+        #expect(coreAcceptance == expectedCoreAcceptance)
+
+        let completionPublication = try boundedSource(
+            from: "case .didCompleteSync:",
+            until: "case .handleDiagnostics:",
+            in: streamingSource
+        )
+        let expectedCompletionPublication = """
+        case .didCompleteSync:
+                    syncClient.db.syncStatus.mutateStatus {
+                        $0.internalDownloadError = nil
+                        if let completedCheckpoint {
+                            $0.completedCheckpoint = completedCheckpoint
+                        }
+                    }
+        """
+        #expect(completionPublication == expectedCompletionPublication)
+
+        let publicationForbiddenFragments = [
+            "SELECT ",
+            "readTransaction",
+            "writeTransaction",
+            "requestLogger",
+            ".logger",
+            "getAll(",
+            "getOptional(",
+            "ps_" + "buckets",
+            "ps_" + "oplog",
         ]
-        for fragment in requiredPublicPipelineFragments {
-            #expect(streamingSource.contains(fragment))
+        for source in [publicationPipeline, completionPublication] {
+            for fragment in publicationForbiddenFragments {
+                #expect(!source.contains(fragment))
+            }
         }
     }
 
