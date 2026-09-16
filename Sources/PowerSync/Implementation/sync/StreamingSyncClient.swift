@@ -585,13 +585,15 @@ private struct ActiveSyncIteration: Sendable {
 
         var hadSyncLine = false
         for try await arg in controlArgs {
-            let control = try await powersyncControl(arg)
-
-            // Parse only after the core has accepted and durably processed this protocol line.
-            // The tracked value remains unpublished until DidCompleteSync confirms application.
+            // Validate into a value-semantic candidate before the core can mutate its
+            // transaction. Commit the candidate only after the core accepts the line.
+            var nextCompletedCheckpointTracker = completedCheckpointTracker
             if case .textLine(line: let line) = arg {
-                try completedCheckpointTracker.receiveAcceptedProtocolLine(line)
+                try nextCompletedCheckpointTracker.receiveProtocolLine(line)
             }
+
+            let control = try await powersyncControl(arg)
+            completedCheckpointTracker = nextCompletedCheckpointTracker
 
             for instr in control {
                 if case let .closeSyncStream(hideDisconnect) = instr {
