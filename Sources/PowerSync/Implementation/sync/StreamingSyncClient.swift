@@ -531,6 +531,7 @@ private struct ActiveSyncIteration: Sendable {
         )))
 
         var controlArgs: SyncControlEvents?
+        var completedCheckpointTracker = CompletedSyncCheckpointTracker()
 
         for instruction in initialInstructions {
             if case .establishSyncStream(request: let request, checkpointRequest: let checkpointRequest) = instruction {
@@ -583,12 +584,23 @@ private struct ActiveSyncIteration: Sendable {
         var hadSyncLine = false
         for try await arg in controlArgs {
             let control = try await powersyncControl(arg)
+
+            // Parse only after the core has accepted and durably processed this protocol line.
+            // The tracked value remains unpublished until DidCompleteSync confirms application.
+            if case .textLine(line: let line) = arg {
+                try completedCheckpointTracker.receiveAcceptedProtocolLine(line)
+            }
+
             for instr in control {
                 if case let .closeSyncStream(hideDisconnect) = instr {
                     return SyncIterationResult(hideDisconnect: hideDisconnect)
                 }
 
-                try await execute(instr: instr, group: &group)
+                try await execute(
+                    instr: instr,
+                    completedCheckpoint: completedCheckpointTracker.current,
+                    group: &group
+                )
             }
 
             if !hadSyncLine && arg.isSyncLine() {
@@ -638,7 +650,11 @@ private struct ActiveSyncIteration: Sendable {
         }
     }
 
-    private func execute(instr: consuming Instruction, group: inout ThrowingTaskGroup<Void, any Error>?) async throws {
+    private func execute(
+        instr: consuming Instruction,
+        completedCheckpoint: CompletedSyncCheckpoint? = nil,
+        group: inout ThrowingTaskGroup<Void, any Error>?
+    ) async throws {
         switch (instr) {
         case .logLine(severity: let severity, line: let line):
             let logger = syncClient.db.logger
@@ -674,6 +690,9 @@ private struct ActiveSyncIteration: Sendable {
         case .didCompleteSync:
             syncClient.db.syncStatus.mutateStatus {
                 $0.internalDownloadError = nil
+                if let completedCheckpoint {
+                    $0.completedCheckpoint = completedCheckpoint
+                }
             }
         case .handleDiagnostics:
             break

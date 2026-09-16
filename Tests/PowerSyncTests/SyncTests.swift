@@ -4,6 +4,129 @@ import Foundation
 import Testing
 
 class InMemorySyncIntegrationTests {
+    @Test func completedCheckpointPublishesOnlyAfterSuccessfulApplication() async throws {
+        let channel = AsyncThrowingChannel<Data, any Error>()
+        let uploadStarted = Signal()
+        let allowUpload = Signal()
+        let logger = InfoCapturingLogger()
+        let db = openDatabase(MockHttpSession { _ in channel }, logger: logger)
+
+        try await db.execute(
+            sql: "INSERT INTO users (id, name) VALUES (uuid(), ?)",
+            parameters: ["pending upload"]
+        )
+        try await db.connect(connector: TestConnector { database in
+            await uploadStarted.complete()
+            await allowUpload.await()
+            let transaction = try await database.getNextCrudTransaction()
+            try await transaction?.complete()
+        }, options: ConnectOptions())
+
+        await uploadStarted.await()
+        await waitForStatus(db.currentStatus) { $0.connected }
+        try await channel.pushLine(.fullCheckpoint(Checkpoint(
+            last_op_id: "0",
+            buckets: [BucketChecksum(bucket: "pending", checksum: 0)],
+            writeCheckpoint: "1000"
+        )))
+        try await channel.pushLine(.checkpointComplete(lastOpId: "0"))
+
+        try await waitUntil {
+            logger.infos.contains { $0.contains("Could not apply checkpoint due to local data") }
+        }
+        #expect(db.currentStatus.completedCheckpoint == nil)
+
+        await allowUpload.complete()
+        await waitForStatus(db.currentStatus) { $0.completedCheckpoint != nil }
+        #expect(db.currentStatus.completedCheckpoint == CompletedSyncCheckpoint(
+            lastOpID: 0,
+            buckets: [.init(name: "pending", checksum: 0)]
+        ))
+
+        try await db.close()
+    }
+
+    @Test func completedCheckpointAppliesDiffRemovalAndRawUTF8Ordering() async throws {
+        let channel = AsyncThrowingChannel<Data, any Error>()
+        let db = openDatabase(MockHttpSession { _ in channel })
+        try await db.connect(connector: TestConnector(), options: ConnectOptions())
+        await waitForStatus(db.currentStatus) { $0.connected }
+
+        let decomposed = "e\u{301}"
+        try await channel.pushLine(.fullCheckpoint(Checkpoint(last_op_id: "1", buckets: [
+            BucketChecksum(bucket: "é", checksum: 0),
+            BucketChecksum(bucket: "z", checksum: 0),
+            BucketChecksum(bucket: decomposed, checksum: 0),
+        ])))
+        try await channel.pushLine(.checkpointComplete(lastOpId: "1"))
+        await waitForStatus(db.currentStatus) { $0.completedCheckpoint?.lastOpID == 1 }
+        #expect(db.currentStatus.completedCheckpoint?.buckets.map(\.name) == [decomposed, "z", "é"])
+
+        try await channel.pushLine(.checkpointDiff(CheckpointDiff(
+            lastOpID: "2",
+            updatedBuckets: [
+                BucketChecksum(bucket: "a", checksum: 0),
+                BucketChecksum(bucket: "é", checksum: 0),
+            ],
+            removedBuckets: ["z"]
+        )))
+        try await channel.pushLine(.checkpointComplete(lastOpId: "2"))
+        await waitForStatus(db.currentStatus) { $0.completedCheckpoint?.lastOpID == 2 }
+
+        #expect(db.currentStatus.completedCheckpoint == CompletedSyncCheckpoint(
+            lastOpID: 2,
+            buckets: [
+                .init(name: "a", checksum: 0),
+                .init(name: decomposed, checksum: 0),
+                .init(name: "é", checksum: 0),
+            ]
+        ))
+
+        try await db.close()
+    }
+
+    @Test func completedCheckpointNormalizesSignedAndUnsignedChecksumBits() throws {
+        var tracker = CompletedSyncCheckpointTracker()
+
+        try tracker.receiveAcceptedProtocolLine(
+            #"{"checkpoint":{"last_op_id":"1","buckets":[{"bucket":"a","checksum":-1}]}}"#
+        )
+        #expect(tracker.current?.buckets == [.init(name: "a", checksum: UInt32.max)])
+
+        try tracker.receiveAcceptedProtocolLine(
+            #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"a","checksum":4294967295}],"removed_buckets":[]}}"#
+        )
+        #expect(tracker.current?.lastOpID == 2)
+        #expect(tracker.current?.buckets == [.init(name: "a", checksum: UInt32.max)])
+    }
+
+    @Test func completedCheckpointTrackerDoesNotQueryPrivateState() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repositoryRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let trackerSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/PowerSync/Implementation/sync/CompletedSyncCheckpointTracker.swift"
+            ),
+            encoding: .utf8
+        )
+
+        let forbiddenFragments = [
+            "ps_" + "buckets",
+            "ps_" + "oplog",
+            "SELECT ",
+            "writeTransaction",
+            "readTransaction",
+            "requestLogger",
+            ".logger",
+        ]
+        for fragment in forbiddenFragments {
+            #expect(!trackerSource.contains(fragment))
+        }
+    }
+
     @Test func decodesCoreSyncStatusTimestampsAsMicroseconds() throws {
         let data = """
         {
@@ -2549,6 +2672,23 @@ private final class WarningCapturingLogger: LoggerProtocol {
 
     func warning(_ message: String, tag: String?) {
         _warnings.withLock { $0.append(message) }
+    }
+}
+
+private final class InfoCapturingLogger: LoggerProtocol {
+    private let _infos = Mutex<[String]>([])
+
+    var infos: [String] {
+        _infos.withLock { $0 }
+    }
+
+    func debug(_ message: String, tag: String?) {}
+    func warning(_ message: String, tag: String?) {}
+    func error(_ message: String, tag: String?) {}
+    func fault(_ message: String, tag: String?) {}
+
+    func info(_ message: String, tag: String?) {
+        _infos.withLock { $0.append(message) }
     }
 }
 

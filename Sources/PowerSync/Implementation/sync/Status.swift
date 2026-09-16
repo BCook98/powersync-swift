@@ -7,6 +7,7 @@ import Foundation
 struct MutableSyncStatus: ~Copyable {
     var core: CoreDownloadSyncStatus = CoreDownloadSyncStatus()
     var uploading: Bool = false
+    var completedCheckpoint: CompletedSyncCheckpoint? = nil
     var internalDownloadError: (any Error & Sendable)?
     var internalUploadError: (any Error & Sendable)?
 }
@@ -16,6 +17,7 @@ fileprivate struct SyncStatusDataImpl: SyncStatusData {
     let core: CoreDownloadSyncStatus
     let downloadProgress: (any SyncDownloadProgress)?
     let uploading: Bool
+    let completedCheckpoint: CompletedSyncCheckpoint?
 
     let internalDownloadError: (any Error & Sendable)?
     let internalUploadError: (any Error & Sendable)?
@@ -23,6 +25,7 @@ fileprivate struct SyncStatusDataImpl: SyncStatusData {
     init(status: borrowing MutableSyncStatus) {
         self.core = status.core
         self.uploading = status.uploading
+        self.completedCheckpoint = status.completedCheckpoint
         self.internalUploadError = status.internalUploadError
         self.internalDownloadError = status.internalDownloadError
         
@@ -224,6 +227,10 @@ final class SwiftSyncStatus: SyncStatus {
 
     var hasSynced: Bool? {
         self.readStatus { current in current.hasSynced }
+    }
+
+    var completedCheckpoint: CompletedSyncCheckpoint? {
+        self.readStatus { current in current.completedCheckpoint }
     }
 
     var downloadError: Any? {
