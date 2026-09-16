@@ -112,6 +112,27 @@ class InMemorySyncIntegrationTests {
 
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
             try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint_diff":{"last_op_id":"1","updated_buckets":[{"bucket":"a","checksum":1},{"bucket":"a","checksum":2}],"removed_buckets":[]}}"#
+            )
+        }
+        #expect(tracker.current == nil)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint_diff":{"last_op_id":"1","updated_buckets":[],"removed_buckets":["a","a"]}}"#
+            )
+        }
+        #expect(tracker.current == nil)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.contradictoryBucketChange) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint_diff":{"last_op_id":"1","updated_buckets":[{"bucket":"a","checksum":1}],"removed_buckets":["a"]}}"#
+            )
+        }
+        #expect(tracker.current == nil)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
+            try tracker.receiveAcceptedProtocolLine(
                 #"{"checkpoint":{"last_op_id":"1","buckets":[{"bucket":"a","checksum":1},{"bucket":"a","checksum":2}]}}"#
             )
         }
@@ -125,6 +146,20 @@ class InMemorySyncIntegrationTests {
         #expect(throws: CompletedSyncCheckpointTrackerError.duplicateBucketName) {
             try tracker.receiveAcceptedProtocolLine(
                 #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"b","checksum":1},{"bucket":"b","checksum":2}],"removed_buckets":[]}}"#
+            )
+        }
+        #expect(tracker.current == accepted)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.duplicateCheckpointEnvelopeKey) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint":{"last_op_id":"2","buckets":[{"bucket":"b","checksum":2}]},"checkpoint":{"last_op_id":"3","buckets":[{"bucket":"c","checksum":3}]}}"#
+            )
+        }
+        #expect(tracker.current == accepted)
+
+        #expect(throws: CompletedSyncCheckpointTrackerError.duplicateCheckpointEnvelopeKey) {
+            try tracker.receiveAcceptedProtocolLine(
+                #"{"checkpoint_diff":{"last_op_id":"2","updated_buckets":[{"bucket":"b","checksum":2}],"removed_buckets":[]},"checkpoint_diff":{"last_op_id":"3","updated_buckets":[],"removed_buckets":["a"]}}"#
             )
         }
         #expect(tracker.current == accepted)

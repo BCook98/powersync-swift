@@ -5,6 +5,7 @@ enum CompletedSyncCheckpointTrackerError: Error, Equatable {
     case duplicateBucketName
     case contradictoryBucketChange
     case ambiguousCheckpointEnvelope
+    case duplicateCheckpointEnvelopeKey
 }
 
 /// Tracks checkpoint state from accepted public sync-protocol lines.
@@ -27,6 +28,8 @@ struct CompletedSyncCheckpointTracker {
     }
 
     mutating func receiveAcceptedProtocolLine(_ line: String) throws {
+        try rejectRepeatedCheckpointEnvelopeKeys(in: line)
+
         let envelope = try StreamingSyncClient.jsonDecoder.decode(
             CheckpointProtocolEnvelope.self,
             from: Data(line.utf8)
@@ -57,9 +60,6 @@ struct CompletedSyncCheckpointTracker {
             guard diff.lastOpID >= 0 else {
                 throw CompletedSyncCheckpointTrackerError.negativeLastOperationID
             }
-            guard lastOpID != nil else {
-                return
-            }
 
             var removedBucketKeys = Set<[UInt8]>()
             for name in diff.removedBuckets {
@@ -82,6 +82,9 @@ struct CompletedSyncCheckpointTracker {
             guard removedBucketKeys.isDisjoint(with: updatedBuckets.keys) else {
                 throw CompletedSyncCheckpointTrackerError.contradictoryBucketChange
             }
+            guard lastOpID != nil else {
+                return
+            }
 
             var nextBuckets = buckets
             for key in removedBucketKeys {
@@ -93,6 +96,87 @@ struct CompletedSyncCheckpointTracker {
             buckets = nextBuckets
             lastOpID = diff.lastOpID
         }
+    }
+}
+
+private func rejectRepeatedCheckpointEnvelopeKeys(in line: String) throws {
+    let scanner = TopLevelJSONObjectKeyScanner(bytes: Array(line.utf8))
+    var seenCheckpointKeys = Set<String>()
+
+    for key in try scanner.keys() where key == "checkpoint" || key == "checkpoint_diff" {
+        guard seenCheckpointKeys.insert(key).inserted else {
+            throw CompletedSyncCheckpointTrackerError.duplicateCheckpointEnvelopeKey
+        }
+    }
+}
+
+/// Preserves top-level JSON key occurrences before `Decodable` collapses repeated keys.
+/// Malformed JSON is left for the typed decoder to reject.
+private struct TopLevelJSONObjectKeyScanner {
+    private let bytes: [UInt8]
+
+    init(bytes: [UInt8]) {
+        self.bytes = bytes
+    }
+
+    func keys() throws -> [String] {
+        var keys: [String] = []
+        var closingBytes: [UInt8] = []
+        var inString = false
+        var isEscaped = false
+        var keyStart: Int?
+        var expectsRootKey = false
+
+        for index in bytes.indices {
+            let byte = bytes[index]
+            if inString {
+                if isEscaped {
+                    isEscaped = false
+                } else if byte == 0x5C { // \
+                    isEscaped = true
+                } else if byte == 0x22 { // "
+                    inString = false
+                    if let keyStart {
+                        let key = try StreamingSyncClient.jsonDecoder.decode(
+                            String.self,
+                            from: Data(bytes[keyStart...index])
+                        )
+                        keys.append(key)
+                        expectsRootKey = false
+                    }
+                    keyStart = nil
+                }
+                continue
+            }
+
+            switch byte {
+            case 0x22: // "
+                inString = true
+                if closingBytes.count == 1, closingBytes[0] == 0x7D, expectsRootKey {
+                    keyStart = index
+                }
+            case 0x7B: // {
+                closingBytes.append(0x7D)
+                if closingBytes.count == 1 {
+                    expectsRootKey = true
+                }
+            case 0x5B: // [
+                closingBytes.append(0x5D)
+            case 0x2C where closingBytes.count == 1 && closingBytes[0] == 0x7D:
+                expectsRootKey = true
+            case 0x7D, 0x5D:
+                guard closingBytes.last == byte else {
+                    break
+                }
+                closingBytes.removeLast()
+                if closingBytes.isEmpty {
+                    return keys
+                }
+            default:
+                break
+            }
+        }
+        return keys
     }
 }
 
